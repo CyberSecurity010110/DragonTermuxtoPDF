@@ -18,34 +18,25 @@ A powerful Python tool that generates a comprehensive PDF containing man pages f
 - Termux app installed on Android
 - Python 3.x
 - Required Python packages:
-  ```bash
   pip install fpdf rich
 
 📥 Installation
 
     Clone the repository:
 
-bash
-
 git clone https://github.com/CyberSecurity010110/DragonTermuxtoPDF.git
 
     Navigate to the project directory:
-
-bash
 
 cd DragonTermuxtoPDF
 
     Install required packages:
 
-bash
-
-pip install -r requirements.txt
+    pip install -r requirements.txt
 
 🚀 Usage
 
 Simply run the script:
-
-bash
 
 python TermuxtoPDF.py
 
