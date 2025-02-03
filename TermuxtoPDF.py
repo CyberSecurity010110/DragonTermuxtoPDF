@@ -20,33 +20,93 @@ class PDF(FPDF):
         self.set_y(-15)
         self.set_font("Arial", size=8)
         self.cell(0, 10, f"Page {self.page_no()}", align="C")
-    
+
     def chapter_title(self, title):
         self.set_font("Arial", 'B', size=12)
         self.cell(0, 10, title, ln=True)
         self.ln(5)
-    
+
     def chapter_body(self, text):
         self.set_font("Courier", size=10)
+        
+        # Set left margin for better readability
+        original_margin = self.l_margin
+        self.set_left_margin(15)
+        
         # Process the text to improve formatting
         formatted_text = self.format_man_page(text)
-        self.multi_cell(0, 5, formatted_text)
-        self.ln()
+        
+        # Split text into paragraphs
+        paragraphs = formatted_text.split('\n\n')
+        
+        for paragraph in paragraphs:
+            # Check if this is a section header
+            if re.match(r'^[A-Z][A-Z\s]+\n-+$', paragraph.strip()):
+                self.set_font("Arial", 'B', size=11)
+                self.ln(5)
+                self.multi_cell(0, 5, paragraph.split('\n')[0])
+                self.ln(2)
+                self.set_font("Courier", size=10)
+            else:
+                self.multi_cell(0, 5, paragraph)
+                self.ln(2)
+        
+        # Restore original margin
+        self.set_left_margin(original_margin)
 
     def format_man_page(self, text):
         # Remove ANSI escape sequences
         text = re.sub(r'\x1b\[[0-9;]*m', '', text)
         
-        # Improve section formatting
-        sections = re.split(r'\n(?=\S+\n=+\n)', text)
-        formatted_sections = []
+        # Remove form feed characters
+        text = text.replace('\f', '')
         
-        for section in sections:
-            # Add extra newlines between sections
-            section = section.strip()
-            formatted_sections.append(section + "\n\n")
+        # Normalize line endings
+        text = text.replace('\r\n', '\n')
         
-        return "\n".join(formatted_sections)
+        # Handle section headers
+        text = re.sub(r'([A-Z][A-Z\s]+)\n\s*\n', r'\n\n\1\n' + '-'*40 + '\n\n', text)
+        
+        # Handle command line options
+        text = re.sub(r'(\s+)(-[-a-zA-Z0-9]+)', r'\1• \2', text)
+        
+        # Improve list formatting
+        text = re.sub(r'^\s{7,}([^\s])', r'     • \1', text, flags=re.MULTILINE)
+        
+        # Handle description blocks
+        text = re.sub(r'(\n\s{3,})([^\s•-])', r'\1    \2', text)
+        
+        # Clean up multiple blank lines
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Split into sections and process each
+        sections = []
+        current_section = []
+        
+        for line in text.split('\n'):
+            # Check if this is a main section header
+            if re.match(r'^[A-Z][A-Z\s]+$', line.strip()):
+                if current_section:
+                    sections.append('\n'.join(current_section))
+                    current_section = []
+                current_section.append(f"\n{line}\n" + '-'*40)
+            else:
+                current_section.append(line)
+        
+        if current_section:
+            sections.append('\n'.join(current_section))
+        
+        # Join sections with proper spacing
+        formatted_text = '\n\n'.join(sections)
+        
+        # Final cleanup
+        # Remove any remaining weird characters
+        formatted_text = re.sub(r'[^\x20-\x7E\n]', '', formatted_text)
+        
+        # Ensure consistent spacing around section headers
+        formatted_text = re.sub(r'\n{2,}([A-Z][A-Z\s]+)\n-+', r'\n\n\1\n-', formatted_text)
+        
+        return formatted_text
 
 def get_all_packages():
     """Retrieve the list of all available Termux packages."""
@@ -143,7 +203,7 @@ class PDFGenerator:
                         for page_name, content in pages.items():
                             self.pdf.chapter_title(f"Man page: {page_name}")
                             self.pdf.chapter_body(content)
-                    
+                        
                     progress.update(pdf_task, advance=1)
                     processed += 1
                 except Exception:
