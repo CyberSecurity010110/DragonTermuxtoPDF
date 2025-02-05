@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import os
 import subprocess
 from fpdf import FPDF
@@ -13,13 +14,19 @@ console = Console()
 class PDF(FPDF):
     def header(self):
         self.set_font("Arial", 'B', size=12)
-        self.cell(0, 10, "Man Pages for Termux Packages", ln=True, align="C")
+        title = "Man Pages for Termux Packages"
+        if hasattr(self, 'current_package'):
+            title += f" ({self.current_package})"
+        self.cell(0, 10, title, ln=True, align="C")
         self.ln(5)
 
     def footer(self):
         self.set_y(-15)
         self.set_font("Arial", size=8)
         self.cell(0, 10, f"Page {self.page_no()}", align="C")
+
+    def set_current_package(self, package):
+        self.current_package = package
 
     def chapter_title(self, title):
         self.set_font("Arial", 'B', size=12)
@@ -34,17 +41,17 @@ class PDF(FPDF):
         self.set_left_margin(15)
         
         # Process the text to improve formatting
-        formatted_text = self.format_man_page(text)
+        formatted_text = self.improved_format_man_page(text)
         
         # Split text into paragraphs
         paragraphs = formatted_text.split('\n\n')
         
         for paragraph in paragraphs:
             # Check if this is a section header
-            if re.match(r'^[A-Z][A-Z\s]+\n-+$', paragraph.strip()):
+            if re.match(r'^[A-Z][A-Z\s]+$', paragraph.strip()):
                 self.set_font("Arial", 'B', size=11)
                 self.ln(5)
-                self.multi_cell(0, 5, paragraph.split('\n')[0])
+                self.multi_cell(0, 5, paragraph)
                 self.ln(2)
                 self.set_font("Courier", size=10)
             else:
@@ -54,59 +61,42 @@ class PDF(FPDF):
         # Restore original margin
         self.set_left_margin(original_margin)
 
-    def format_man_page(self, text):
-        # Remove ANSI escape sequences
-        text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+    def improved_format_man_page(self, text):
+        if not text:
+            return ""
         
-        # Remove form feed characters
-        text = text.replace('\f', '')
+        # Basic cleanup
+        text = re.sub(r'\x1b\[[0-9;]*m', '', text)  # Remove ANSI sequences
+        text = text.replace('\f', '')  # Remove form feed
+        text = re.sub(r'_+', '', text)  # Remove underscores
+        text = re.sub(r'(.)\1', r'\1', text)  # Remove doubled characters
         
-        # Normalize line endings
+        # Normalize spaces and line endings
+        text = re.sub(r'[ \t]+', ' ', text)
         text = text.replace('\r\n', '\n')
         
-        # Handle section headers
-        text = re.sub(r'([A-Z][A-Z\s]+)\n\s*\n', r'\n\n\1\n' + '-'*40 + '\n\n', text)
+        # Process sections
+        lines = text.split('\n')
+        processed_lines = []
+        in_section_header = False
         
-        # Handle command line options
-        text = re.sub(r'(\s+)(-[-a-zA-Z0-9]+)', r'\1• \2', text)
-        
-        # Improve list formatting
-        text = re.sub(r'^\s{7,}([^\s])', r'     • \1', text, flags=re.MULTILINE)
-        
-        # Handle description blocks
-        text = re.sub(r'(\n\s{3,})([^\s•-])', r'\1    \2', text)
-        
-        # Clean up multiple blank lines
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        
-        # Split into sections and process each
-        sections = []
-        current_section = []
-        
-        for line in text.split('\n'):
-            # Check if this is a main section header
-            if re.match(r'^[A-Z][A-Z\s]+$', line.strip()):
-                if current_section:
-                    sections.append('\n'.join(current_section))
-                    current_section = []
-                current_section.append(f"\n{line}\n" + '-'*40)
+        for line in lines:
+            # Clean the line
+            line = line.rstrip()
+            
+            # Check if it's a section header
+            if re.match(r'^[A-Z][A-Z\s]+$', line):
+                in_section_header = True
+                processed_lines.extend(['', line, '-' * 40, ''])
             else:
-                current_section.append(line)
+                if line:
+                    processed_lines.append(line)
         
-        if current_section:
-            sections.append('\n'.join(current_section))
-        
-        # Join sections with proper spacing
-        formatted_text = '\n\n'.join(sections)
+        text = '\n'.join(processed_lines)
         
         # Final cleanup
-        # Remove any remaining weird characters
-        formatted_text = re.sub(r'[^\x20-\x7E\n]', '', formatted_text)
-        
-        # Ensure consistent spacing around section headers
-        formatted_text = re.sub(r'\n{2,}([A-Z][A-Z\s]+)\n-+', r'\n\n\1\n-', formatted_text)
-        
-        return formatted_text
+        text = re.sub(r'\n{3,}', '\n\n', text)  # Remove excess blank lines
+        return text
 
 def get_all_packages():
     """Retrieve the list of all available Termux packages."""
@@ -124,7 +114,7 @@ def get_package_man_pages(package):
         # First, try to find man pages in the package
         result = subprocess.run(["dpkg", "-L", package], capture_output=True, text=True)
         if result.returncode == 0:
-            man_files = [line for line in result.stdout.splitlines() 
+            man_files = [line for line in result.stdout.splitlines()
                         if '/man/' in line and not line.endswith('.gz')]
             return man_files
     except Exception:
@@ -134,7 +124,13 @@ def get_package_man_pages(package):
 def fetch_man_page(man_path):
     """Fetch the content of a man page."""
     try:
-        result = subprocess.run(["man", man_path], capture_output=True, text=True)
+        # Use col to remove formatting characters
+        result = subprocess.run(
+            f"man {man_path} | col -b",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
         if result.returncode == 0:
             return result.stdout
     except Exception:
@@ -147,76 +143,143 @@ class PDFGenerator:
         self.pdf.set_auto_page_break(auto=True, margin=15)
         self.queue = Queue()
         self.lock = threading.Lock()
+        self.processed_count = 0
+        self.total_packages = 0
+        self.failed_packages = []
+        self.packages_with_man = []
+        self.total_man_pages = 0
 
     def process_package(self, package, progress, task_id):
-        man_pages = get_package_man_pages(package)
-        if not man_pages:
-            # Try direct man page fetch if no files found
-            content = fetch_man_page(package)
-            if content:
-                self.queue.put((package, {package: content}))
-            progress.update(task_id, advance=1)
-            return
-
-        package_pages = {}
-        for man_path in man_pages:
-            content = fetch_man_page(man_path)
-            if content:
-                name = os.path.basename(man_path)
-                package_pages[name] = content
-        
-        if package_pages:
-            self.queue.put((package, package_pages))
-        progress.update(task_id, advance=1)
+        try:
+            man_pages = get_package_man_pages(package)
+            has_content = False
+            
+            if not man_pages:
+                content = fetch_man_page(package)
+                if content:
+                    self.queue.put((package, {package: content}))
+                    has_content = True
+            else:
+                package_pages = {}
+                for man_path in man_pages:
+                    content = fetch_man_page(man_path)
+                    if content:
+                        name = os.path.basename(man_path)
+                        package_pages[name] = content
+                        has_content = True
+                
+                if package_pages:
+                    self.queue.put((package, package_pages))
+            
+            with self.lock:
+                self.processed_count += 1
+                if has_content:
+                    self.packages_with_man.append(package)
+                progress.update(task_id, completed=self.processed_count)
+                
+        except Exception as e:
+            self.failed_packages.append((package, str(e)))
+            with self.lock:
+                self.processed_count += 1
+                progress.update(task_id, completed=self.processed_count)
 
     def generate_pdf(self, packages):
+        self.total_packages = len(packages)
+        debug_file = "man_pages_debug.txt"
+        
+        console.print(f"[blue]Processing {self.total_packages} packages...[/blue]")
+        
+        # Clear debug file
+        with open(debug_file, 'w', encoding='utf-8') as debug:
+            debug.write(f"Starting processing of {self.total_packages} packages\n")
+        
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
-            console=console
+            console=console,
+            refresh_per_second=1
         ) as progress:
-            # Create tasks for both phases
-            fetch_task = progress.add_task("[blue]Fetching man pages...", total=len(packages))
-            pdf_task = progress.add_task("[green]Generating PDF...", total=len(packages))
-
-            # Create threads for parallel processing
-            threads = []
-            for package in packages:
-                thread = threading.Thread(
-                    target=self.process_package,
-                    args=(package, progress, fetch_task)
-                )
-                thread.start()
-                threads.append(thread)
-
-            # Process results as they come in
-            processed = 0
-            while processed < len(packages):
-                try:
-                    package, pages = self.queue.get(timeout=1)
-                    with self.lock:
-                        self.pdf.add_page()
-                        self.pdf.chapter_title(f"Package: {package}")
-                        
-                        for page_name, content in pages.items():
-                            self.pdf.chapter_title(f"Man page: {page_name}")
-                            self.pdf.chapter_body(content)
-                        
-                    progress.update(pdf_task, advance=1)
-                    processed += 1
-                except Exception:
-                    if all(not t.is_alive() for t in threads):
-                        break
-
-            # Wait for all threads to complete
-            for thread in threads:
-                thread.join()
-
+            fetch_task = progress.add_task(
+                "[blue]Fetching man pages...",
+                total=self.total_packages
+            )
+            pdf_task = progress.add_task(
+                "[green]Generating PDF...",
+                total=self.total_packages
+            )
+            
+            # Process packages in smaller batches
+            batch_size = 50
+            total_processed = 0
+            
+            for i in range(0, len(packages), batch_size):
+                batch = packages[i:i + batch_size]
+                threads = []
+                
+                console.print(f"[cyan]Processing batch {(i//batch_size)+1} ({i+1}-{min(i+batch_size, self.total_packages)}/{self.total_packages})[/cyan]")
+                
+                for package in batch:
+                    thread = threading.Thread(
+                        target=self.process_package,
+                        args=(package, progress, fetch_task)
+                    )
+                    thread.start()
+                    threads.append(thread)
+                
+                pdf_processed = 0
+                with open(debug_file, 'a', encoding='utf-8') as debug:
+                    while pdf_processed < len(batch):
+                        try:
+                            package, pages = self.queue.get(timeout=1)
+                            with self.lock:
+                                self.pdf.set_current_package(package)
+                                self.pdf.add_page()
+                                self.pdf.chapter_title(f"Package: {package}")
+                                
+                                debug.write(f"\n{'='*50}\nPackage: {package}\n{'='*50}\n")
+                                
+                                for page_name, content in pages.items():
+                                    self.pdf.chapter_title(f"Man page: {page_name}")
+                                    self.pdf.chapter_body(content)
+                                    self.total_man_pages += 1
+                                    
+                                    debug.write(f"\n{'-'*30}\nMan page: {page_name}\n{'-'*30}\n")
+                                    debug.write(content)
+                                    debug.write("\n\n")
+                                
+                                debug.flush()
+                            
+                            pdf_processed += 1
+                            total_processed += 1
+                            progress.update(pdf_task, completed=total_processed)
+                            
+                        except Exception as e:
+                            if all(not t.is_alive() for t in threads):
+                                break
+                            console.print(f"[red]Error processing package: {e}[/red]")
+                
+                for thread in threads:
+                    thread.join()
+        
         output_file = "termux_man_pages.pdf"
         self.pdf.output(output_file)
-        console.print(f"[bold green]PDF generated successfully: {output_file}[/bold green]")
+        
+        # Print summary
+        console.print("\n[bold blue]Processing Summary:[/bold blue]")
+        console.print(f"Total packages processed: {self.total_packages}")
+        console.print(f"Packages with man pages: {len(self.packages_with_man)}")
+        console.print(f"Total man pages found: {self.total_man_pages}")
+        console.print(f"Failed packages: {len(self.failed_packages)}")
+        
+        console.print(f"\n[bold green]PDF generated successfully: {output_file}[/bold green]")
+        console.print(f"[bold blue]Debug output written to: {debug_file}[/bold blue]")
+        
+        if self.failed_packages:
+            console.print("\n[yellow]Failed packages:[/yellow]")
+            for package, error in self.failed_packages:
+                console.print(f"[red]{package}: {error}[/red]")
 
 def main():
     packages = get_all_packages()
@@ -225,7 +288,7 @@ def main():
         return
     
     pdf_generator = PDFGenerator()
-    pdf_generator.generate_pdf(packages)
+    pdf_generator.generate_pdf(packages[:])
 
 if __name__ == "__main__":
     main()
