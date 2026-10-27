@@ -1,294 +1,610 @@
 #!/usr/bin/env python3
+"""
+DragonTermuxtoPDF
+=================
+A Python tool that generates a comprehensive, human-readable PDF guide
+containing the man pages of Termux packages.
 
-import os
+Designed to run inside Termux on Android. On first run it automatically
+checks for and installs missing dependencies (the `man` package and the
+required Python modules) so you can just run:
+
+    python TermuxtoPDF.py
+
+The output PDF (termux_man_pages_guide.pdf) contains for every package
+that ships a man page:
+    * the package name
+    * its usage (SYNOPSIS)
+    * a detailed description (DESCRIPTION)
+    * the complete, cleaned-up man page
+
+A package index with page numbers is included at the end of the PDF.
+Progress is shown live in the terminal and any failures are logged to
+termux_manpdf_debug.log for easy debugging.
+"""
+
+import logging
+import re
 import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
 from fpdf import FPDF
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-import threading
-from queue import Queue
-import re
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.panel import Panel
+from rich.table import Table
 
 console = Console()
 
-class PDF(FPDF):
-    def header(self):
-        self.set_font("Arial", 'B', size=12)
-        title = "Man Pages for Termux Packages"
-        if hasattr(self, 'current_package'):
-            title += f" ({self.current_package})"
-        self.cell(0, 10, title, ln=True, align="C")
-        self.ln(5)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+OUTPUT_PDF = "termux_man_pages_guide.pdf"
+LOG_FILE = "termux_manpdf_debug.log"
+DEBUG_FILE = "man_pages_debug_raw.txt"
 
-    def footer(self):
-        self.set_y(-15)
-        self.set_font("Arial", size=8)
-        self.cell(0, 10, f"Page {self.page_no()}", align="C")
+REQUIRED_PIP_PACKAGES = ["fpdf", "rich"]
+REQUIRED_TERMUX_PACKAGES = ["man"]
 
-    def set_current_package(self, package):
-        self.current_package = package
+FETCH_WORKERS = 4
+MAN_FETCH_TIMEOUT = 30
 
-    def chapter_title(self, title):
-        self.set_font("Arial", 'B', size=12)
-        self.cell(0, 10, title, ln=True)
-        self.ln(5)
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("DragonTermuxtoPDF")
 
-    def chapter_body(self, text):
-        self.set_font("Courier", size=10)
-        
-        # Set left margin for better readability
-        original_margin = self.l_margin
-        self.set_left_margin(15)
-        
-        # Process the text to improve formatting
-        formatted_text = self.improved_format_man_page(text)
-        
-        # Split text into paragraphs
-        paragraphs = formatted_text.split('\n\n')
-        
-        for paragraph in paragraphs:
-            # Check if this is a section header
-            if re.match(r'^[A-Z][A-Z\s]+$', paragraph.strip()):
-                self.set_font("Arial", 'B', size=11)
-                self.ln(5)
-                self.multi_cell(0, 5, paragraph)
-                self.ln(2)
-                self.set_font("Courier", size=10)
-            else:
-                self.multi_cell(0, 5, paragraph)
-                self.ln(2)
-        
-        # Restore original margin
-        self.set_left_margin(original_margin)
 
-    def improved_format_man_page(self, text):
-        if not text:
-            return ""
-        
-        # Basic cleanup
-        text = re.sub(r'\x1b\[[0-9;]*m', '', text)  # Remove ANSI sequences
-        text = text.replace('\f', '')  # Remove form feed
-        text = re.sub(r'_+', '', text)  # Remove underscores
-        text = re.sub(r'(.)\1', r'\1', text)  # Remove doubled characters
-        
-        # Normalize spaces and line endings
-        text = re.sub(r'[ \t]+', ' ', text)
-        text = text.replace('\r\n', '\n')
-        
-        # Process sections
-        lines = text.split('\n')
-        processed_lines = []
-        in_section_header = False
-        
-        for line in lines:
-            # Clean the line
-            line = line.rstrip()
-            
-            # Check if it's a section header
-            if re.match(r'^[A-Z][A-Z\s]+$', line):
-                in_section_header = True
-                processed_lines.extend(['', line, '-' * 40, ''])
-            else:
-                if line:
-                    processed_lines.append(line)
-        
-        text = '\n'.join(processed_lines)
-        
-        # Final cleanup
-        text = re.sub(r'\n{3,}', '\n\n', text)  # Remove excess blank lines
-        return text
+# === Dependency management ===
+
+def run_command(cmd, *, shell=False, timeout=60):
+    """Run an external command and return a CompletedProcess-like object."""
+    try:
+        return subprocess.run(
+            cmd, shell=shell, capture_output=True, text=True, timeout=timeout
+        )
+    except Exception as exc:
+        log.exception("Command failed: %r", cmd)
+        return None
+
+
+def command_exists(cmd):
+    """Return True if *cmd* can be found on PATH."""
+    result = run_command(["sh", "-c", f"command -v {cmd}"])
+    return result is not None and result.returncode == 0 and bool(result.stdout.strip())
+
+
+def python_package_installed(name):
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+
+def pip_install(package):
+    console.print(f"[yellow]Installing Python package [bold]{package}[/bold] via pip...[/yellow]")
+    result = run_command(
+        [sys.executable, "-m", "pip", "install", "--quiet", package], timeout=180
+    )
+    ok = result is not None and result.returncode == 0
+    if not ok and result is not None:
+        log.warning("pip install %s failed:\n%s", package, result.stderr)
+    return ok
+
+
+def termux_pkg_install(package):
+    console.print(f"[yellow]Installing Termux package [bold]{package}[/bold] via pkg...[/yellow]")
+    result = run_command(["pkg", "install", "-y", package], timeout=300)
+    ok = result is not None and result.returncode == 0
+    if not ok and result is not None:
+        log.warning("pkg install %s failed:\n%s", package, result.stderr)
+    return ok
+
+
+def ensure_dependencies():
+    """Check for required dependencies and auto-install anything that is missing."""
+    missing = []
+
+    for package in REQUIRED_PIP_PACKAGES:
+        if not python_package_installed(package):
+            missing.append(("pip", package))
+
+    if command_exists("pkg"):
+        for package in REQUIRED_TERMUX_PACKAGES:
+            if not command_exists(package):
+                missing.append(("pkg", package))
+    else:
+        console.print(
+            "[bold yellow]Note:[/bold yellow] `pkg` was not found, so this does not appear to be "
+            "Termux. Termux-specific packages cannot be auto-installed here; man page lookups "
+            "will fail unless `man` is already available."
+        )
+
+    if not missing:
+        console.print("[green]All required dependencies are satisfied.[/green]")
+        return True
+
+    console.print(
+        Panel.fit(
+            "[bold blue]Auto-installing missing dependencies[/bold blue]",
+            subtitle="DragonTermuxtoPDF",
+        )
+    )
+    table = Table(show_header=True, header_style="bold magenta", box=None)
+    table.add_column("Type", style="cyan")
+    table.add_column("Package", style="green")
+    for mtype, mname in missing:
+        table.add_row(mtype, mname)
+    console.print(table)
+
+    for mtype, mname in missing:
+        ok = pip_install(mname) if mtype == "pip" else termux_pkg_install(mname)
+        if not ok:
+            console.print(
+                f"[red]Failed to install {mname}. Install it manually and re-run.[/red]"
+            )
+            log.error("Failed to install dependency: %s (%s)", mname, mtype)
+            return False
+
+    console.print("[green]All dependencies installed successfully.[/green]")
+    return True
+
+
+# === Package discovery ===
 
 def get_all_packages():
-    """Retrieve the list of all available Termux packages."""
-    console.print("[blue]Fetching the list of all Termux packages...[/blue]")
-    result = subprocess.run(["pkg", "list-all"], capture_output=True, text=True)
-    if result.returncode != 0:
-        console.print("[red]Failed to retrieve package list.[/red]")
+    """Retrieve the list of all available Termux packages via `pkg list-all`."""
+    console.print("[blue]Fetching the list of all available Termux packages...[/blue]")
+    result = run_command(["pkg", "list-all"], timeout=120)
+    if result is None or result.returncode != 0:
+        console.print("[red]Failed to retrieve package list. Is `pkg` available?[/red]")
+        log.error("pkg list-all failed: %s", result.stderr if result else "no result")
         return []
-    packages = [line.split("/")[0] for line in result.stdout.splitlines() if line]
-    return sorted(set(packages))
 
-def get_package_man_pages(package):
-    """Get all available man pages for a package."""
-    try:
-        # First, try to find man pages in the package
-        result = subprocess.run(["dpkg", "-L", package], capture_output=True, text=True)
-        if result.returncode == 0:
-            man_files = [line for line in result.stdout.splitlines()
-                        if '/man/' in line and not line.endswith('.gz')]
-            return man_files
-    except Exception:
-        pass
-    return []
+    packages = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # pkg list-all prints "package/version"
+        name = line.split("/")[0].strip()
+        if name:
+            packages.append(name)
 
-def fetch_man_page(man_path):
-    """Fetch the content of a man page."""
-    try:
-        # Use col to remove formatting characters
-        result = subprocess.run(
-            f"man {man_path} | col -b",
-            shell=True,
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            return result.stdout
-    except Exception:
-        pass
+    packages = sorted(set(packages))
+    console.print(f"[green]Found {len(packages)} available packages.[/green]")
+    log.info("Discovered %d packages", len(packages))
+    return packages
+
+
+# === Man page text cleaning ===
+
+UNICODE_TO_ASCII = {
+    "\u2014": "-",
+    "\u2013": "-",
+    "\u2010": "-",
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201A": ",",
+    "\u201C": '"',
+    "\u201D": '"',
+    "\u2022": "*",
+    "\u2023": "*",
+    "\u2026": "...",
+    "\u00A0": " ",
+    "\u00B7": "*",
+    "\u2265": ">=",
+    "\u2264": "<=",
+    "\u00D7": "x",
+    "\u00F7": "/",
+}
+
+
+def safe_text(text):
+    """Return text safe for FPDF's core (Latin-1) fonts."""
+    if not text:
+        return ""
+    for uni, ascii_ in UNICODE_TO_ASCII.items():
+        text = text.replace(uni, ascii_)
+    return text.encode("latin-1", "ignore").decode("latin-1")
+
+
+def clean_man_text(text):
+    """Strip man page control characters and return clean, readable text."""
+    if not text:
+        return ""
+
+    # Remove ANSI escape sequences (colour, bold, etc.)
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+    text = re.sub(r"\x1b\].*?\x07", "", text)  # OSC sequences
+
+    # Undo over-striking used by man for bold / underline:
+    #   X\bX  -> X  (bold)
+    #   _\bX  -> X  (underline)
+    #   X\b_  -> X  (underline)
+    text = re.sub(r"(.)\x08\1", r"\1", text)
+    text = re.sub(r"_\x08(.)", r"\1", text)
+    text = re.sub(r"(.)\x08_", r"\1", text)
+    text = text.replace("\x08", "")  # remaining backspaces
+
+    # Form feeds / carriage returns
+    text = text.replace("\f", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "")
+
+    # Remove leftover underscore underlining rules
+    text = re.sub(r"_{2,}", "", text)
+
+    # Collapse horizontal whitespace, keep line structure
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+SECTION_HEADING = re.compile(r"^([A-Z][A-Z/\- ]{2,})$")
+
+
+def split_man_sections(text):
+    """Split a cleaned man page into (heading, body) chunks."""
+    sections = []
+    current_heading = None
+    buffer = []
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if SECTION_HEADING.match(stripped) and len(stripped) < 45:
+            if current_heading is not None:
+                sections.append((current_heading, "\n".join(buffer).strip()))
+            current_heading = stripped
+            buffer = []
+        else:
+            buffer.append(line)
+
+    if current_heading is not None:
+        sections.append((current_heading, "\n".join(buffer).strip()))
+    elif buffer:
+        sections.append((None, "\n".join(buffer).strip()))
+
+    return sections
+
+
+def extract_section(text, wanted):
+    """Return the body of a named man section (case-insensitive), or None."""
+    for heading, body in split_man_sections(text):
+        if heading and heading.lower() == wanted.lower():
+            return body
     return None
 
-class PDFGenerator:
+
+# === Man page fetching ===
+
+def fetch_man_page(package):
+    """Fetch and clean the man page for a single package."""
+    try:
+        result = run_command(["man", package], timeout=MAN_FETCH_TIMEOUT)
+        if result is None or result.returncode != 0 or not result.stdout.strip():
+            return None
+        return clean_man_text(result.stdout)
+    except Exception as exc:
+        log.exception("Failed to fetch man page for %s", package)
+        return None
+
+
+def fetch_all_man_pages(packages):
+    """Fetch man pages for every package in parallel."""
+    results = {}
+    failed = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        fetch_task = progress.add_task("[cyan]Fetching man pages...", total=len(packages))
+
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+            future_to_package = {
+                executor.submit(fetch_man_page, package): package
+                for package in packages
+            }
+            for future in as_completed(future_to_package):
+                package = future_to_package[future]
+                try:
+                    content = future.result()
+                except Exception as exc:  # pragma: no cover
+                    log.exception("Unexpected error while fetching %s", package)
+                    content = None
+
+                results[package] = content
+                if content is None:
+                    failed.append(package)
+
+                progress.update(
+                    fetch_task,
+                    description=f"[cyan]Fetching {package}...",
+                    advance=1,
+                )
+
+    return results, failed
+
+
+# === PDF generation ===
+
+class TermuxManPDF(FPDF):
+    """PDF document for the Termux man page guide."""
+
     def __init__(self):
-        self.pdf = PDF()
-        self.pdf.set_auto_page_break(auto=True, margin=15)
-        self.queue = Queue()
-        self.lock = threading.Lock()
-        self.processed_count = 0
-        self.total_packages = 0
-        self.failed_packages = []
-        self.packages_with_man = []
-        self.total_man_pages = 0
+        super().__init__(orientation="P", unit="mm", format="A4")
+        self.set_auto_page_break(auto=True, margin=15)
+        self.set_margins(15, 15, 15)
+        self.package_index = []  # (package_name, page_number)
 
-    def process_package(self, package, progress, task_id):
-        try:
-            man_pages = get_package_man_pages(package)
-            has_content = False
-            
-            if not man_pages:
-                content = fetch_man_page(package)
-                if content:
-                    self.queue.put((package, {package: content}))
-                    has_content = True
-            else:
-                package_pages = {}
-                for man_path in man_pages:
-                    content = fetch_man_page(man_path)
-                    if content:
-                        name = os.path.basename(man_path)
-                        package_pages[name] = content
-                        has_content = True
-                
-                if package_pages:
-                    self.queue.put((package, package_pages))
-            
-            with self.lock:
-                self.processed_count += 1
-                if has_content:
-                    self.packages_with_man.append(package)
-                progress.update(task_id, completed=self.processed_count)
-                
-        except Exception as e:
-            self.failed_packages.append((package, str(e)))
-            with self.lock:
-                self.processed_count += 1
-                progress.update(task_id, completed=self.processed_count)
+    def header(self):
+        if self.page_no() == 1:
+            return  # title page has no running header
+        self.set_font("Arial", "B", 10)
+        self.set_text_color(40, 40, 40)
+        self.cell(0, 7, "DragonTermuxtoPDF - Termux Package Man Pages", align="C", ln=True)
+        self.set_font("Arial", "", 8)
+        self.set_text_color(120, 120, 120)
+        self.cell(0, 5, f"Generated: {datetime.now():%Y-%m-%d %H:%M}", align="C", ln=True)
+        self.ln(3)
 
-    def generate_pdf(self, packages):
-        self.total_packages = len(packages)
-        debug_file = "man_pages_debug.txt"
-        
-        console.print(f"[blue]Processing {self.total_packages} packages...[/blue]")
-        
-        # Clear debug file
-        with open(debug_file, 'w', encoding='utf-8') as debug:
-            debug.write(f"Starting processing of {self.total_packages} packages\n")
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-            refresh_per_second=1
-        ) as progress:
-            fetch_task = progress.add_task(
-                "[blue]Fetching man pages...",
-                total=self.total_packages
+    def footer(self):
+        self.set_y(-12)
+        self.set_font("Arial", "", 8)
+        self.set_text_color(120, 120, 120)
+        self.cell(0, 6, f"Page {self.page_no()}", align="C")
+
+    def chapter_title(self, text, size=13):
+        self.set_font("Arial", "B", size)
+        self.set_text_color(30, 60, 110)
+        self.cell(0, 8, safe_text(text), ln=True)
+        self.set_draw_color(30, 60, 110)
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+        self.ln(4)
+
+    def section_heading(self, text):
+        self.set_font("Arial", "B", 11)
+        self.set_text_color(50, 50, 50)
+        self.cell(0, 6, safe_text(text), ln=True)
+        self.ln(1)
+
+    def body_text(self, text, size=9, font="Courier"):
+        self.set_font(font, "", size)
+        self.set_text_color(0, 0, 0)
+        self.multi_cell(0, 4.2, safe_text(text))
+        self.ln(2)
+
+    def body_paragraph(self, text, size=9, font="Arial"):
+        self.set_font(font, "", size)
+        self.set_text_color(0, 0, 0)
+        self.multi_cell(0, 4.2, safe_text(text))
+        self.ln(2)
+
+    def add_title_page(self, total_scanned, with_man):
+        self.add_page()
+        self.ln(50)
+        self.set_font("Arial", "B", 26)
+        self.set_text_color(30, 60, 110)
+        self.cell(0, 15, "DragonTermuxtoPDF", align="C", ln=True)
+        self.ln(2)
+        self.set_font("Arial", "B", 16)
+        self.set_text_color(60, 60, 60)
+        self.cell(0, 10, "Termux Package Man Page Guide", align="C", ln=True)
+        self.ln(12)
+        self.set_font("Arial", "", 11)
+        self.set_text_color(90, 90, 90)
+        self.cell(
+            0,
+            7,
+            "A comprehensive reference of man pages for available Termux packages",
+            align="C",
+            ln=True,
+        )
+        self.cell(0, 7, f"Packages scanned: {total_scanned}", align="C", ln=True)
+        self.cell(0, 7, f"Packages with man pages: {with_man}", align="C", ln=True)
+        self.cell(0, 7, f"Generated: {datetime.now():%Y-%m-%d %H:%M}", align="C", ln=True)
+        self.cell(0, 7, "Platform: Termux (Android)", align="C", ln=True)
+        self.ln(18)
+        self.set_font("Arial", "I", 9)
+        self.multi_cell(
+            0,
+            6,
+            safe_text(
+                "Each package section lists the package name, its usage (SYNOPSIS), a "
+                "detailed description (DESCRIPTION), and the complete man page. "
+                "Packages without an available man page are logged to "
+                "man_pages_debug_raw.txt."
+            ),
+            align="C",
+        )
+
+    def add_contents(self, total_scanned, with_man, without_man):
+        self.add_page()
+        self.chapter_title("Contents")
+        self.body_paragraph(
+            "This guide contains man page references for Termux packages. Every package "
+            "that ships a man page has its own section showing the package name, usage "
+            "(SYNOPSIS), description (DESCRIPTION), and the full man page text.",
+            size=9,
+        )
+        self.ln(6)
+        self.section_heading("Generation summary")
+        self.body_paragraph(
+            f"Packages scanned:   {total_scanned}\n"
+            f"With man pages:     {with_man}\n"
+            f"Without man pages:  {without_man}\n"
+            f"Output file:        {OUTPUT_PDF}",
+            size=9,
+            font="Courier",
+        )
+        self.ln(8)
+        self.section_heading("How to read this guide")
+        self.body_paragraph(
+            "Package sections are arranged alphabetically and each begins on a new page. "
+            "See the Package Index at the end of this document to jump directly to a "
+            "specific package.",
+            size=9,
+        )
+
+
+# === generate_pdf ===
+
+def generate_pdf(packages_with_man, total_scanned, without_man, man_contents):
+    """Render the man page guide to OUTPUT_PDF."""
+    pdf = TermuxManPDF()
+    pdf.set_title("Termux Package Man Page Guide")
+    pdf.set_author("DragonTermuxtoPDF")
+
+    pdf.add_title_page(total_scanned, len(packages_with_man))
+    pdf.add_contents(total_scanned, len(packages_with_man), without_man)
+
+    log.info("Rendering %d package sections into PDF", len(packages_with_man))
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        render_task = progress.add_task(
+            "[green]Generating PDF pages...", total=len(packages_with_man)
+        )
+
+        for package in packages_with_man:
+            progress.update(render_task, description=f"[green]Rendering {package}...")
+
+            pdf.add_page()
+            pdf.package_index.append((package, pdf.page_no()))
+
+            pdf.chapter_title(f"Package: {package}")
+            pdf.ln(2)
+
+            content = man_contents[package]
+
+            pdf.section_heading("Usage (SYNOPSIS)")
+            synopsis = extract_section(content, "SYNOPSIS")
+            pdf.body_paragraph(
+                synopsis or "No SYNOPSIS section found in this man page.",
+                size=9,
+                font="Courier",
             )
-            pdf_task = progress.add_task(
-                "[green]Generating PDF...",
-                total=self.total_packages
+
+            pdf.section_heading("Description (DESCRIPTION)")
+            description = extract_section(content, "DESCRIPTION")
+            pdf.body_paragraph(
+                description or "No DESCRIPTION section found in this man page.",
+                size=9,
+                font="Courier",
             )
-            
-            # Process packages in smaller batches
-            batch_size = 50
-            total_processed = 0
-            
-            for i in range(0, len(packages), batch_size):
-                batch = packages[i:i + batch_size]
-                threads = []
-                
-                console.print(f"[cyan]Processing batch {(i//batch_size)+1} ({i+1}-{min(i+batch_size, self.total_packages)}/{self.total_packages})[/cyan]")
-                
-                for package in batch:
-                    thread = threading.Thread(
-                        target=self.process_package,
-                        args=(package, progress, fetch_task)
-                    )
-                    thread.start()
-                    threads.append(thread)
-                
-                pdf_processed = 0
-                with open(debug_file, 'a', encoding='utf-8') as debug:
-                    while pdf_processed < len(batch):
-                        try:
-                            package, pages = self.queue.get(timeout=1)
-                            with self.lock:
-                                self.pdf.set_current_package(package)
-                                self.pdf.add_page()
-                                self.pdf.chapter_title(f"Package: {package}")
-                                
-                                debug.write(f"\n{'='*50}\nPackage: {package}\n{'='*50}\n")
-                                
-                                for page_name, content in pages.items():
-                                    self.pdf.chapter_title(f"Man page: {page_name}")
-                                    self.pdf.chapter_body(content)
-                                    self.total_man_pages += 1
-                                    
-                                    debug.write(f"\n{'-'*30}\nMan page: {page_name}\n{'-'*30}\n")
-                                    debug.write(content)
-                                    debug.write("\n\n")
-                                
-                                debug.flush()
-                            
-                            pdf_processed += 1
-                            total_processed += 1
-                            progress.update(pdf_task, completed=total_processed)
-                            
-                        except Exception as e:
-                            if all(not t.is_alive() for t in threads):
-                                break
-                            console.print(f"[red]Error processing package: {e}[/red]")
-                
-                for thread in threads:
-                    thread.join()
-        
-        output_file = "termux_man_pages.pdf"
-        self.pdf.output(output_file)
-        
-        # Print summary
-        console.print("\n[bold blue]Processing Summary:[/bold blue]")
-        console.print(f"Total packages processed: {self.total_packages}")
-        console.print(f"Packages with man pages: {len(self.packages_with_man)}")
-        console.print(f"Total man pages found: {self.total_man_pages}")
-        console.print(f"Failed packages: {len(self.failed_packages)}")
-        
-        console.print(f"\n[bold green]PDF generated successfully: {output_file}[/bold green]")
-        console.print(f"[bold blue]Debug output written to: {debug_file}[/bold blue]")
-        
-        if self.failed_packages:
-            console.print("\n[yellow]Failed packages:[/yellow]")
-            for package, error in self.failed_packages:
-                console.print(f"[red]{package}: {error}[/red]")
+
+            pdf.section_heading("Complete Man Page")
+            pdf.body_text(content, size=8)
+
+            pdf.ln(2)
+            progress.update(render_task, advance=1)
+
+    # ---- Package index (at the end) ----
+    pdf.add_page()
+    pdf.chapter_title("Package Index")
+    pdf.body_paragraph(
+        "Each package section below starts on the page number shown. Sections appear in "
+        "the same order in this guide.", size=9
+    )
+    pdf.ln(4)
+    pdf.set_font("Courier", "", 8)
+    for package, page in pdf.package_index:
+        pdf.cell(0, 5, safe_text(f"{package} .... page {page}"), ln=True)
+
+    pdf.output(OUTPUT_PDF)
+    log.info("PDF written to %s", OUTPUT_PDF)
+    console.print(f"\n[bold green]PDF generated successfully:[/bold green] {OUTPUT_PDF}")
+
 
 def main():
+    console.print(
+        Panel.fit(
+            "[bold blue]DragonTermuxtoPDF[/bold blue]\nTermux Package Man Page Guide",
+            subtitle="🐉📱📄",
+        )
+    )
+
+    if not ensure_dependencies():
+        console.print("[red]Aborting: required dependencies are missing.[/red]")
+        sys.exit(1)
+
     packages = get_all_packages()
     if not packages:
-        console.print("[red]No packages found. Exiting...[/red]")
-        return
-    
-    pdf_generator = PDFGenerator()
-    pdf_generator.generate_pdf(packages[:])
+        console.print("[red]No packages found. Exiting.[/red]")
+        sys.exit(1)
+
+    console.print(
+        f"[blue]Fetching man pages for {len(packages)} packages (this may take a while)...[/blue]"
+    )
+    man_contents, failed = fetch_all_man_pages(packages)
+
+    # Write raw debug dump for every package
+    with open(DEBUG_FILE, "w", encoding="utf-8") as debug:
+        debug.write(f"DragonTermuxtoPDF debug dump - {datetime.now():%Y-%m-%d %H:%M}\n")
+        debug.write(f"Packages scanned: {len(packages)}\n")
+        debug.write(
+            f"Packages with man pages: {sum(1 for c in man_contents.values() if c)}\n"
+        )
+        debug.write("=" * 70 + "\n\n")
+        for package in sorted(packages):
+            debug.write(f"\n{'='*15} Package: {package} {'='*15}\n\n")
+            content = man_contents.get(package)
+            if content:
+                debug.write(content)
+            else:
+                debug.write("[No man page available]\n")
+            debug.write("\n\n")
+    log.info("Debug dump written to %s", DEBUG_FILE)
+
+    packages_with_man = sorted([p for p in packages if man_contents.get(p)])
+    without_man = [p for p in packages if not man_contents.get(p)]
+
+    console.print(
+        f"[blue]Rendering {len(packages_with_man)} packages with man pages into PDF...[/blue]"
+    )
+    if without_man:
+        console.print(
+            f"[yellow]{len(without_man)} packages have no available man page "
+            f"(listed in {DEBUG_FILE}).[/yellow]"
+        )
+
+    generate_pdf(packages_with_man, len(packages), len(without_man), man_contents)
+
+    console.print(f"[bold blue]Log / debug files:[/bold blue] {LOG_FILE} / {DEBUG_FILE}")
+    if failed:
+        console.print(
+            f"[red]{len(failed)} packages failed during fetch; see {LOG_FILE} for details.[/red]"
+        )
+
 
 if __name__ == "__main__":
     main()
